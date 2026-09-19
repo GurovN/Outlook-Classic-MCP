@@ -19,14 +19,16 @@ def main() -> None:
     log = logging.getLogger("outlook_mcp")
 
     mcp, bridge = build_server()
-    log.info("Starting outlook_mcp (stdio transport)")
+    log.info(
+        "Starting outlook_mcp (stdio transport) - Outlook is attached "
+        "lazily on the first tool call, not now"
+    )
 
-    try:
-        bridge.start()
-    except Exception as exc:  # noqa: BLE001
-        log.error("Failed to attach to Outlook: %s", exc)
-        sys.exit(2)
-
+    # NOTE: bridge.start() is intentionally NOT called here. Attaching
+    # runs Dispatch("Outlook.Application"), which makes DCOM launch
+    # OUTLOOK.EXE — so starting eagerly opened Outlook every time this
+    # server loaded, whether or not any Outlook tool was ever used.
+    # OutlookBridge.call() attaches on demand instead.
     try:
         mcp.run()
     finally:

@@ -10,6 +10,10 @@ Why one persistent thread instead of a fresh client per call:
 * Survives Outlook auto-launching (Dispatch will spawn ``OUTLOOK.EXE``
   if it isn't running, and the same connection serves every later call).
 * Matches Outlook's strict STA threading model.
+
+The bridge attaches lazily: the COM thread is spawned by the first
+:meth:`OutlookBridge.call`, never at server startup, so configuring this
+server does not by itself open Outlook.
 """
 
 from __future__ import annotations
@@ -83,6 +87,7 @@ class OutlookBridge:
 
     def __init__(self) -> None:
         self._thread: threading.Thread | None = None
+        self._start_lock = threading.Lock()
         self._queue: queue.Queue = queue.Queue()
         self._ready = threading.Event()
         self._shutdown = threading.Event()
@@ -95,27 +100,57 @@ class OutlookBridge:
     def start(self) -> None:
         """Spawn the COM thread and wait for it to attach to Outlook.
 
+        Deliberately NOT called when the server boots: attaching runs
+        ``Dispatch("Outlook.Application")``, which makes DCOM launch
+        OUTLOOK.EXE. Merely having this MCP server configured should
+        never open Outlook, so :meth:`call` invokes this on the first
+        real tool call instead.
+
+        Idempotent and thread-safe — concurrent callers serialise on the
+        lock and return once the bridge is ready. A failed attempt is not
+        sticky: the state is reset so the next call retries.
+
         Raises whatever the COM thread raised if Dispatch failed (with a
         friendly message — Outlook normally auto-launches; failure here
         usually means the user denied a UAC prompt or Outlook is mid-
         crash recovery).
         """
-        self._thread = threading.Thread(
-            target=self._run, daemon=True, name="outlook-com"
-        )
-        self._thread.start()
-        if not self._ready.wait(timeout=_READY_TIMEOUT_SEC):
-            raise RuntimeError(
-                f"Outlook COM thread did not become ready within "
-                f"{_READY_TIMEOUT_SEC}s. If Outlook didn't auto-launch, "
-                "open it manually and retry."
+        with self._start_lock:
+            if self._thread is not None and self._thread.is_alive():
+                return
+            self._ready.clear()
+            self._shutdown.clear()
+            self._init_error = None
+            thread = threading.Thread(
+                target=self._run, daemon=True, name="outlook-com"
             )
-        if self._init_error is not None:
-            raise self._init_error
-        # Read the cached primitive — touching self._namespace from this
-        # (main) thread would raise RPC_E_WRONG_THREAD because the COM
-        # interface is marshalled to the bridge thread.
-        logger.info("Bridge ready (mailbox: %s)", self._mailbox_name)
+            self._thread = thread
+            logger.info("Attaching to Outlook (first use)")
+            thread.start()
+            if not self._ready.wait(timeout=_READY_TIMEOUT_SEC):
+                self._abandon(thread)
+                raise RuntimeError(
+                    f"Outlook COM thread did not become ready within "
+                    f"{_READY_TIMEOUT_SEC}s. If Outlook didn't auto-launch, "
+                    "open it manually and retry."
+                )
+            if self._init_error is not None:
+                error = self._init_error
+                self._abandon(thread)
+                raise error
+            # Read the cached primitive — touching self._namespace from this
+            # (main) thread would raise RPC_E_WRONG_THREAD because the COM
+            # interface is marshalled to the bridge thread.
+            logger.info("Bridge ready (mailbox: %s)", self._mailbox_name)
+
+    def _abandon(self, thread: threading.Thread) -> None:
+        """Tear down a failed attach so the next call can retry cleanly."""
+        self._shutdown.set()
+        thread.join(timeout=2)
+        self._thread = None
+        self._init_error = None
+        self._outlook = None
+        self._namespace = None
 
     def _run(self) -> None:
         import pythoncom
@@ -198,13 +233,18 @@ class OutlookBridge:
 
     async def call(self, func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         """Run ``func(outlook, namespace, *args, **kwargs)`` on the COM thread."""
+        loop = asyncio.get_running_loop()
         if self._thread is None or not self._thread.is_alive():
-            raise RuntimeError("Bridge is not running. Did you forget to call start()?")
+            # Lazy attach — this is what launches Outlook, and it only
+            # happens because a tool was actually invoked. start() blocks
+            # for as long as Outlook takes to come up, so keep it off the
+            # event loop.
+            await loop.run_in_executor(None, self.start)
+
         done = threading.Event()
         holder: dict[str, Any] = {}
         self._queue.put((func, args, kwargs, done, holder))
 
-        loop = asyncio.get_running_loop()
         signaled = await loop.run_in_executor(
             None, lambda: done.wait(timeout=_CALL_TIMEOUT_SEC)
         )
